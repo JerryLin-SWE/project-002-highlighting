@@ -65,6 +65,7 @@ const ROOT_LAYOUT_COLUMN_KEYS: readonly (readonly string[])[] = [
  */
 export default function Tiles() {
     const { tiles } = useTilesProvider();
+    //predictions come from the PredictedTilesProvider 
     const { predictedTiles } = usePredictedTiles();
     const [dataLocation, dispatch] = useReducer(stackReducer<string>, []);
     const isRootView = dataLocation.length === 0;
@@ -76,6 +77,8 @@ export default function Tiles() {
     const { setPredictedTiles } = usePredictedTiles();
 
     useEffect(() => {
+        // console.log("DEBUG predictedTiles:", predictedTiles);
+        // console.log("DEBUG activeHighlights:", Array.from(activeHighlights));
         if (Object.keys(tiles).length === 0) return;
         if (isRootView) return setCurrentFrame(tiles);
 
@@ -88,7 +91,7 @@ export default function Tiles() {
         });
 
         setCurrentFrame(newFrame);
-    }, [tiles, dataLocation, isRootView]);
+    }, [tiles, dataLocation, isRootView, predictedTiles, activeHighlights]);
 
     /**
      * Recursively check if a tile or any of its subtiles are predicted

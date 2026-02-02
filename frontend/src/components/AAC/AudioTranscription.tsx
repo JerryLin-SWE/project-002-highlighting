@@ -6,6 +6,7 @@ import { useUtteredTiles } from "@/react-state-management/providers/useUtteredTi
 import { useRecordingControl } from "@/react-state-management/providers/RecordingControlProvider";
 import { useTranscript } from "@/react-state-management/providers/TranscriptProvider";
 
+const BACKEND_URL = "http://localhost:5001";
 /**
  * AudioTranscription component for recording audio and displaying real-time transcriptions.
  * 
@@ -474,7 +475,7 @@ const AudioTranscription = () => {
         // Don't clear them here - only update when new data arrives
 
         try {
-            const response = await fetch('http://localhost:5000/api/nextTilePred', {
+            const response = await fetch(`${BACKEND_URL}/api/nextTilePred`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -562,7 +563,7 @@ const AudioTranscription = () => {
                 console.log(`[Periodic Prediction] Starting prediction at ${new Date().toLocaleTimeString()}`);
 
                 // Call the prediction API
-                fetch('http://localhost:5000/api/nextTilePred', {
+                fetch(`${BACKEND_URL}/api/nextTilePred`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -603,7 +604,7 @@ const AudioTranscription = () => {
     React.useEffect(() => {
         // establish socket once - only on mount/unmount, not when startRecording changes
         console.log(`[Frontend] Initializing socket connection`);
-        socketRef.current = io("http://localhost:5000");
+        socketRef.current = io(BACKEND_URL);
         
         // Add connection logging
         socketRef.current.on("connect", () => {

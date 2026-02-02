@@ -1,7 +1,8 @@
 import React from 'react';
 import { render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import AudioTranscription from 'frontend/src/components/AAC/AudioTranscription';
+import AudioTranscription from './AudioTranscription';
+
 
 // Mock socket.io-client
 const mockSocket = {

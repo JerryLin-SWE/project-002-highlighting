@@ -19,6 +19,7 @@ import os from "os";
 import { pipeline } from "@xenova/transformers";
 // loads variable from .env file into process.env
 dotenv.config();
+const PORT = Number(process.env.PORT) || 5001;
 import { File } from "node:buffer";
 globalThis.File = File;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -1465,8 +1466,8 @@ async function startServer() {
     await preloadAllModels();
     
     // Start server after models are loaded
-    server.listen(5000, () => {
-      console.log("Server running on http://localhost:5000");
+    server.listen(PORT, () => {
+      console.log('Server running on http://localhost:' + PORT);
       console.log("Temp directory:", tempDir);
       console.log("[Configuration] Transcription Model: Local Whisper");
       console.log("[Configuration] Prediction Model: Local LLM with vector search");
