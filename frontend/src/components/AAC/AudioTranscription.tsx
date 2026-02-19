@@ -7,6 +7,12 @@ import { useRecordingControl } from "@/react-state-management/providers/Recordin
 import { useTranscript } from "@/react-state-management/providers/TranscriptProvider";
 
 const BACKEND_URL = "http://localhost:5001";
+
+type HighlightsPayload = {
+    transcript?: string;
+    predictedTiles?: string[];
+    confidenceByWord?: Record<string, number>;
+};
 /**
  * AudioTranscription component for recording audio and displaying real-time transcriptions.
  * 
@@ -280,6 +286,14 @@ const AudioTranscription = () => {
         });
     }, [setTranscript]);
 
+    const highlightsHandler = React.useCallback((payload: HighlightsPayload) => {
+        if (!payload || !Array.isArray(payload.predictedTiles)) {
+            return;
+        }
+        setPredictedTiles(payload.predictedTiles);
+        setPredictionTimestamp(Date.now());
+    }, [setPredictedTiles]);
+
     /**
      * Starts the audio recording process
      * 
@@ -301,6 +315,7 @@ const AudioTranscription = () => {
         if (socketRef.current) {
             console.log("Setting up transcript listener, socket connected:", socketRef.current.connected);
             socketRef.current.on("transcript", transcriptHandler);
+            socketRef.current.on("highlights", highlightsHandler);
         } else {
             console.error("Socket not initialized!");
         }
@@ -311,11 +326,11 @@ const AudioTranscription = () => {
         });
 
         // start recorder
-        mediaRecorderRef.current.start(3000);
+        mediaRecorderRef.current.start(500);
         // print mediaRecorder state
         console.log("recorder state", mediaRecorderRef.current.state);
         console.log("recorder started");
-    }, [transcriptHandler, isActive]);
+    }, [transcriptHandler, highlightsHandler, isActive]);
 
     /**
      * Stops the audio recording process
@@ -334,6 +349,7 @@ const AudioTranscription = () => {
         mediaRecorderRef.current!.stop();
         if (socketRef.current) {
             socketRef.current.off("transcript", transcriptHandler);
+            socketRef.current.off("highlights", highlightsHandler);
         }
         // Clear transcript and predicted tiles when stopping recording
         setTranscript("");
@@ -609,14 +625,11 @@ const AudioTranscription = () => {
         // Add connection logging
         socketRef.current.on("connect", () => {
             console.log("Socket connected:", socketRef.current?.id);
-            // Auto-start recording if MediaRecorder is ready and isActive is true
-            // Use a small delay to ensure everything is initialized
-            setTimeout(() => {
-                if (mediaRecorderRef.current && socketRef.current?.connected && !isRecordingRef.current && isActive) {
-                    console.log("Auto-starting recording after socket connection...");
-                    startRecordingRef.current(); // Use ref to get latest version
-                }
-            }, 500);
+            // Auto-start immediately when socket is ready.
+            if (mediaRecorderRef.current && socketRef.current?.connected && !isRecordingRef.current && isActiveRef.current) {
+                console.log("Auto-starting recording after socket connection...");
+                startRecordingRef.current(); // Use ref to get latest version
+            }
         });
         
         socketRef.current.on("disconnect", (reason) => {
@@ -630,11 +643,13 @@ const AudioTranscription = () => {
         
         return () => {
             if (socketRef.current) {
-                console.log(`[Frontend] Cleaning up socket connection (component unmounting)`);
-                console.log(`[Frontend] Cleanup stack trace:`, new Error().stack);
-                socketRef.current.disconnect();
-                socketRef.current = null;
-            }
+                    console.log(`[Frontend] Cleaning up socket connection (component unmounting)`);
+                    console.log(`[Frontend] Cleanup stack trace:`, new Error().stack);
+                    socketRef.current.off("transcript", transcriptHandler);
+                    socketRef.current.off("highlights", highlightsHandler);
+                    socketRef.current.disconnect();
+                    socketRef.current = null;
+                }
             // Clean up auto-prediction timeout
             if (autoPredictionTimeoutRef.current) {
                 clearTimeout(autoPredictionTimeoutRef.current);
@@ -648,7 +663,7 @@ const AudioTranscription = () => {
                 clearTimeout(tileClickDebounceTimeoutRef.current);
             }
         };
-    }, []); // Empty dependency array - only run on mount/unmount
+    }, [transcriptHandler, highlightsHandler]); // Run again only if handlers change
 
     /**
      * Effect to auto-start recording when both MediaRecorder and Socket are ready
@@ -679,12 +694,12 @@ const AudioTranscription = () => {
             if (tryAutoStart()) {
                 clearInterval(checkInterval);
             }
-        }, 1000); // Check every second
+        }, 200); // Check 5x per second
 
-        // Stop checking after 10 seconds to avoid infinite checking
+        // Stop checking after a short bootstrap window
         const timeout = setTimeout(() => {
             clearInterval(checkInterval);
-        }, 10000);
+        }, 3000);
 
         return () => {
             clearInterval(checkInterval);
@@ -778,6 +793,7 @@ const AudioTranscription = () => {
                 mediaRecorderRef.current.stop();
                 if (socketRef.current) {
                     socketRef.current.off("transcript", transcriptHandler);
+                    socketRef.current.off("highlights", highlightsHandler);
                 }
             }
             // Clear transcript and predicted tiles
@@ -790,7 +806,7 @@ const AudioTranscription = () => {
                 startRecording();
             }
         }
-    }, [isActive, startRecording, transcriptHandler]);
+    }, [isActive, startRecording, transcriptHandler, highlightsHandler]);
 
     /**
      * Effect to set up periodic prediction every 15 seconds

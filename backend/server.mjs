@@ -126,6 +126,7 @@ app.use((req, res, next) => {
  * - Uses local LLM with local vector search for tile prediction
  * - Uses local Whisper model for audio transcription
  */
+//Hard coded 
 console.log('Running in local mode - using local LLM and local Whisper transcription');
 
 /**
@@ -1593,7 +1594,9 @@ io.on("connection", (socket) => {
    * @type {number}
    * @description Defines how frequently the audio buffer is processed
    */
-  const CHUNK_DURATION = 3000; // 3 seconds - process more frequently to catch words sooner 
+
+  //CHANGE THIS WAS 3000
+  const CHUNK_DURATION = 1000; // 3 seconds - process more frequently to catch words sooner 
 
   /**
    * Initializes the FFmpeg process for audio conversion
@@ -1687,8 +1690,10 @@ io.on("connection", (socket) => {
     
     // Dynamic chunk sizing: min 3 seconds, max 6 seconds
     // 3 seconds = 96000 bytes, 6 seconds = 192000 bytes
-    const minChunkSize = 96000; // 3 seconds = 16000 samples/sec * 2 bytes/sample * 3 sec
-    const maxChunkSize = 192000; // 6 seconds = 16000 samples/sec * 2 bytes/sample * 6 sec
+    // const minChunkSize = 96000; // 3 seconds = 16000 samples/sec * 2 bytes/sample * 3 sec
+    // const maxChunkSize = 192000; // 6 seconds = 16000 samples/sec * 2 bytes/sample * 6 sec
+    const minChunkSize = 48000;  // 1.5 seconds
+    const maxChunkSize = 96000;  // 3 seconds
     
     // Trigger immediate processing if we have enough audio and not already processing
     // Use dynamic sizing: process when we have at least min, but prefer max for better quality
@@ -1836,9 +1841,29 @@ io.on("connection", (socket) => {
         
         // Send the transcription if needed
         if (shouldSendTranscription) {
+          //send the raw transcript to front end
           socket.emit("transcript", transcribedText);
+          //Changes: compute predicted next tiles based on the transcript only 
+          //pressedTiles is empty for now
+        
+
+          const {predictions, confidenceMap} = await predictNextTilesLocalLLM(
+            transcribedText,
+            [],
+            10
+          );
+
+          //send predictions to frontend
+
+          socket.emit("highlights", {
+            transcript: transcribedText,
+            predictedTiles : predictions,
+            confidenceByWord :confidenceMap
+          });
+
           lastTranscription = transcribedText;
           lastTranscriptionTime = now;
+
         }
       } else {
         // Transcription returned empty - audio was processed but result was empty (silence or noise)
