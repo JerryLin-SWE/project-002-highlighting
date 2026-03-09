@@ -5,6 +5,7 @@ import { usePredictedTiles } from "@/react-state-management/providers/PredictedT
 import { useUtteredTiles } from "@/react-state-management/providers/useUtteredTiles";
 import { useRecordingControl } from "@/react-state-management/providers/RecordingControlProvider";
 import { useTranscript } from "@/react-state-management/providers/TranscriptProvider";
+import * as ngramService from '@/util/AAC/ngramService';
 
 const BACKEND_URL = "http://localhost:5001";
 
@@ -726,6 +727,11 @@ const AudioTranscription = () => {
         // Only trigger if tiles actually changed (length increased, meaning a new tile was clicked)
         if (utteredTiles.length > previousUtteredTilesLengthRef.current && utteredTiles.length > 0) {
             previousUtteredTilesLengthRef.current = utteredTiles.length;
+            // Instant N-gram prediction (zero latency)
+            const ngramResults = ngramService.getSuggestions(utteredTiles.map(t => t.text), 5);
+            if (ngramResults.length > 0) {
+            setPredictedTiles(ngramResults);
+            }
             
             console.log(`[Prediction] Tile clicked (${utteredTiles.length} tiles) - debouncing prediction`);
             

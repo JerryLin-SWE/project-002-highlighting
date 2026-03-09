@@ -1,6 +1,6 @@
 import { createContext, useContext, useReducer } from "react";
 import { stackReducer } from "../reducers/stackReducer";
-
+import * as ngramService from '@/util/AAC/ngramService';
 import { TileData } from "@/components/AAC/TileTypes";
 import { EMPTY_FUNCTION } from "@/util/constants";
 import { TileHistoryReducer, TileHistoryTileProps } from "../reducers/tileHistoryReducer";
@@ -54,7 +54,15 @@ export default function UtteredTilesProvider({ children }: UtteredTilesProviderP
             type: "add",
             payload: item,
         });
+
+        ngramService.learnWord(
+            item.text,
+            tiles[tiles.length - 1]?.text,
+            tiles[tiles.length - 2]?.text
+        );
+
     };
+
 
     const removeLastTile = () => {
         dispatchTileState({

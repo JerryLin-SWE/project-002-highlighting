@@ -6,7 +6,7 @@ import getTilesByEmail, { GetTileData } from "@/util/CustomTile/getTilesByEmail"
 import { EMPTY_FUNCTION } from "@/util/constants";
 import { useSession } from "next-auth/react";
 import React, { useState, useContext, createContext, useEffect } from "react";
-
+import * as ngramService from '@/util/AAC/ngramService';
 interface TilesContext {
     tiles: TileAssets;
     flatList: FlatTileAssets;
@@ -53,6 +53,8 @@ export default function TileProvider({ children }: TileProviderProps) {
         // replace with actual tile getter
         const flatTileRes = getTileFlatList();
         setFlatList(flatTileRes);
+        ngramService.loadModel();
+        ngramService.setTileLabels(Object.values(flatTileRes).map(t => t.text));
     }, []);
 
     useEffect(() => {
