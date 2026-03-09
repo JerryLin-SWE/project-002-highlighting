@@ -3,6 +3,7 @@ import React, { createContext, useContext, useState, ReactNode } from 'react';
 /**
  * Context for predicted tiles from the AI model
  */
+//defines waht the shared data looks like
 interface PredictedTilesContextType {
     predictedTiles: string[];
     setPredictedTiles: (tiles: string[]) => void;
