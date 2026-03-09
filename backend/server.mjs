@@ -27,6 +27,7 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABA
 const SUPABASE_TABLE = process.env.SUPABASE_LOG_TABLE || 'transcript_highlights';
 const isSupabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_KEY);
 let supabaseConfigWarned = false;
+const PREDICTION_MODE = String(process.env.PREDICTION_MODE || 'vector').toLowerCase() === 'llm' ? 'llm' : 'vector';
 
 /**
  * Express application instance
@@ -123,11 +124,10 @@ app.use((req, res, next) => {
 
 /**
  * Server runs in local mode only
- * - Uses local LLM with local vector search for tile prediction
+ * - Uses local vector prediction for tile ranking (LLM optional via env)
  * - Uses local Whisper model for audio transcription
  */
-//Hard coded 
-console.log('Running in local mode - using local LLM and local Whisper transcription');
+console.log(`Running in local mode - using ${PREDICTION_MODE === 'llm' ? 'local LLM + vector search' : 'local vector ranking'} and local Whisper transcription`);
 
 /**
  * Load words from words.json file
@@ -297,15 +297,15 @@ app.post('/api/nextTilePred', async (req, res) => {
       });
     }
 
-    // Use Local LLM with vector search
+    // Use local prediction path (vector by default, LLM optional via env)
     const predictionMode = contextLines.trim() && validPressedTiles.length > 0 
       ? 'transcript and tiles'
       : contextLines.trim() 
         ? 'transcript only'
         : 'tiles only';
-    console.log(`[Prediction] Using Local LLM with vector search (mode: ${predictionMode})`);
+    console.log(`[Prediction] Using local ${PREDICTION_MODE} predictor (mode: ${predictionMode})`);
     
-    const { predictions: predicted, confidenceMap } = await predictNextTilesLocalLLM(contextLines, validPressedTiles, 10);
+    const { predictions: predicted, confidenceMap } = await predictNextTilesLocal(contextLines, validPressedTiles, 10);
 
     // Log highlight event to Supabase without blocking the response path
     const transcriptText = (typeof transcript === 'string' && transcript.trim()) ? transcript : contextLines;
@@ -738,16 +738,16 @@ const cleanTranscription = (text) => {
  * 
  * @function transcribeAudioLocal
  * @description Transcribes audio data using the local Whisper model
- * @param {string} audioFilePath - Path to the WAV audio file
+ * @param {Buffer|string} audioInput - WAV data buffer or path to WAV audio file
  * @returns {Promise<string>} The transcribed text
  * @async
  */
-async function transcribeAudioLocal(audioFilePath) {
+async function transcribeAudioLocal(audioInput) {
   try {
     const whisper = await getLocalWhisperPipeline();
     
-    // Read the WAV file
-    const wavBuffer = fs.readFileSync(audioFilePath);
+    // Accept either in-memory WAV data (preferred) or a path fallback.
+    const wavBuffer = Buffer.isBuffer(audioInput) ? audioInput : fs.readFileSync(audioInput);
     
     // Convert WAV to Float32Array (normalized audio samples)
     // This function also logs audio stats
@@ -761,8 +761,8 @@ async function transcribeAudioLocal(audioFilePath) {
     // Calculate RMS energy across entire audio
     const rmsEnergy = calculateRMSEnergy(audioData);
     
-    // Skip if completely silent (threshold set to 0.0002)
-    if (rmsEnergy < 0.0002) {
+    // Skip if completely silent (threshold set to 0.002)
+    if (rmsEnergy < 0.002) {
       return '';
     }
     
@@ -775,8 +775,8 @@ async function transcribeAudioLocal(audioFilePath) {
         language: 'en', // Specify language to avoid detection step
         // Anti-hallucination parameters
         temperature: [0.0, 0.2],
-        no_speech_threshold: 0.3, 
-        logprob_threshold: -3.0, 
+        no_speech_threshold: 0.5, 
+        logprob_threshold: -1.5, 
         compression_ratio_threshold: 2.4, 
       });
     } catch (error) {
@@ -1003,6 +1003,92 @@ async function getLocalLLMPipeline() {
   return __localLLMPipeline;
 }
 
+const PREDICTION_EXCLUDED_WORDS = new Set([
+  'he','she','it','they','we','you','him','her','his','hers','theirs','mine','yours','ours',
+  'and','or','but','because','if','when','where','what','who','how','why',
+  'at','by','for','from','in','of','on','to','with','up','down','over','under','through',
+  'am','is','are','was','were','be','been','being','have','has','had','do','does','did',
+  'will','would','could','should','may','might','can','must',
+  'again','also','still','very','really','maybe','definitely','almost','even','just','only',
+  'bottom','top','side','middle','front','back','left','right','center',
+  'ai','animal','chair','bridge','bring','thing','stuff','place','way','time','day','night','year','month','week','hour','minute','second',
+  'about','around','somewhere','anywhere','everywhere','nowhere','awesome','cool','nice','great','wonderful','amazing','fantastic'
+]);
+
+function buildCombinedPredictionContext(contextLines = '', pressedTiles = []) {
+  if (contextLines.trim() && pressedTiles.length > 0) {
+    return `Recently pressed tiles: ${pressedTiles.join(', ')}. Transcript: "${contextLines}"`;
+  }
+  if (contextLines.trim()) {
+    return `Transcript: "${contextLines}"`;
+  }
+  if (pressedTiles.length > 0) {
+    return `Recently pressed tiles: ${pressedTiles.join(', ')}`;
+  }
+  return 'next word';
+}
+
+function normalizeSimilarityConfidence(value) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0;
+  const clamped = Math.max(-1, Math.min(1, value));
+  return Number(((clamped + 1) / 2).toFixed(4));
+}
+
+async function getPredictionScores(contextLines = '', pressedTiles = []) {
+  const labels = __labelList.filter(w => !PREDICTION_EXCLUDED_WORDS.has(String(w).toLowerCase()));
+  if (!labels.length) {
+    return { labels: [], sims: [], buildConfidenceMap: () => ({}) };
+  }
+
+  // Build label embedding cache once for fast vector ranking.
+  if (!__labelEmbeddingsCache || __labelEmbeddingsCache.length !== labels.length) {
+    console.log(`Computing embeddings for ${labels.length} labels (first time only)...`);
+    __labelEmbeddingsCache = [];
+    for (let i = 0; i < labels.length; i++) {
+      const emb = await embedText(labels[i]);
+      __labelEmbeddingsCache.push(emb);
+    }
+    console.log('Label embeddings cached successfully.');
+  }
+
+  const queryEmb = await embedText(buildCombinedPredictionContext(contextLines, pressedTiles));
+  const sims = __labelEmbeddingsCache.map(e => cosineSimilarity(queryEmb, e));
+
+  const recentPressedLower = new Set(pressedTiles.map(tile => String(tile).toLowerCase()));
+  if (recentPressedLower.size > 0) {
+    for (let i = 0; i < labels.length; i++) {
+      if (recentPressedLower.has(String(labels[i]).toLowerCase())) {
+        sims[i] += 0.03;
+      }
+    }
+  }
+
+  const labelScoreLookup = labels.reduce((acc, label, idx) => {
+    acc[String(label).toLowerCase()] = sims[idx];
+    return acc;
+  }, {});
+
+  const buildConfidenceMap = (words) => words.reduce((map, word) => {
+    const raw = labelScoreLookup[String(word).toLowerCase()];
+    map[word] = normalizeSimilarityConfidence(raw);
+    return map;
+  }, {});
+
+  return { labels, sims, buildConfidenceMap };
+}
+
+/**
+ * Fast local vector-only prediction (default path).
+ */
+async function predictNextTilesLocalRanked(contextLines = '', pressedTiles = [], topN = 10) {
+  const { labels, sims, buildConfidenceMap } = await getPredictionScores(contextLines, pressedTiles);
+  if (!labels.length) return { predictions: [], confidenceMap: {} };
+
+  const indices = topNIndices(sims, Math.min(topN, labels.length));
+  const predictions = indices.map(i => labels[i]);
+  return { predictions, confidenceMap: buildConfidenceMap(predictions) };
+}
+
 /**
  * Local LLM-based prediction with vector search (offline)
  * Combines local vector search with local LLM for intelligent predictions
@@ -1019,69 +1105,15 @@ async function getLocalLLMPipeline() {
  * @async
  */
 async function predictNextTilesLocalLLM(contextLines = '', pressedTiles = [], topN = 10) {
-  const excluded = new Set([
-    'he','she','it','they','we','you','him','her','his','hers','theirs','mine','yours','ours',
-    'and','or','but','because','if','when','where','what','who','how','why',
-    'at','by','for','from','in','of','on','to','with','up','down','over','under','through',
-    'am','is','are','was','were','be','been','being','have','has','had','do','does','did',
-    'will','would','could','should','may','might','can','must',
-    'again','also','still','very','really','maybe','definitely','almost','even','just','only',
-    'bottom','top','side','middle','front','back','left','right','center',
-    'ai','animal','chair','bridge','bring','thing','stuff','place','way','time','day','night','year','month','week','hour','minute','second',
-    'about','around','somewhere','anywhere','everywhere','nowhere','awesome','cool','nice','great','wonderful','amazing','fantastic'
-  ]);
-
-  const labels = __labelList.filter(w => !excluded.has(String(w).toLowerCase()));
+  const { labels, sims, buildConfidenceMap } = await getPredictionScores(contextLines, pressedTiles);
   if (!labels.length) return { predictions: [], confidenceMap: {} };
-
-  // Ensure embeddings are cached
-  if (!__labelEmbeddingsCache || __labelEmbeddingsCache.length !== labels.length) {
-    console.log(`Computing embeddings for ${labels.length} labels (first time only)...`);
-    __labelEmbeddingsCache = [];
-    for (let i = 0; i < labels.length; i++) {
-      const label = labels[i];
-      const emb = await embedText(label);
-      __labelEmbeddingsCache.push(emb);
-    }
-    console.log('Label embeddings cached successfully.');
-  }
-
-  // Create combined context from transcript and/or pressed tiles
-  let combinedContext = '';
-  if (contextLines.trim() && pressedTiles.length > 0) {
-    combinedContext = `Recently pressed tiles: ${pressedTiles.join(', ')}. Transcript: "${contextLines}"`;
-  } else if (contextLines.trim()) {
-    combinedContext = `Transcript: "${contextLines}"`;
-  } else if (pressedTiles.length > 0) {
-    combinedContext = `Recently pressed tiles: ${pressedTiles.join(', ')}`;
-  } else {
-    // Fallback: use empty context (shouldn't happen due to validation, but handle gracefully)
-    combinedContext = '';
-  }
-
-  // Embed the combined context for vector search
-  const queryEmb = await embedText(combinedContext || 'next word');
-  const sims = __labelEmbeddingsCache.map(e => cosineSimilarity(queryEmb, e));
-  const labelScoreLookup = labels.reduce((acc, label, idx) => {
-    acc[String(label).toLowerCase()] = sims[idx];
-    return acc;
-  }, {});
-  const normalizeConfidence = (value) => {
-    if (typeof value !== 'number' || Number.isNaN(value)) return 0;
-    const clamped = Math.max(-1, Math.min(1, value));
-    return Number(((clamped + 1) / 2).toFixed(4));
-  };
-  const buildConfidenceMap = (words) => words.reduce((map, word) => {
-    const raw = labelScoreLookup[String(word).toLowerCase()];
-    map[word] = normalizeConfidence(raw);
-    return map;
-  }, {});
   
   // Get a larger set of candidate words from vector search (top 50-80) for LLM to consider
 
   const topK = Math.min(60, labels.length);
   const topIndices = topNIndices(sims, topK);
   const candidateWords = topIndices.map(i => labels[i]);
+  const candidateLookup = new Map(candidateWords.map(word => [String(word).toLowerCase(), word]));
 
   // Use local LLM to select best words based on available context
   try {
@@ -1162,16 +1194,18 @@ Return words only, one per line:
         // Basic filters
         if (word.length <= 1) return false;
         // Must be in the candidate words list
-        if (!candidateWords.some(cw => cw.toLowerCase() === word)) return false;
+        if (!candidateLookup.has(word)) return false;
         return true;
       })
+      .map(word => candidateLookup.get(word))
       .slice(0, topN); // Limit to topN
 
     // If LLM didn't generate enough valid words, fall back to vector search results
     if (extractedWords.length < topN) {
       const vectorSearchResults = topIndices.slice(0, topN).map(i => labels[i]);
       // Combine and deduplicate
-      const combined = [...extractedWords, ...vectorSearchResults.filter(w => !extractedWords.includes(String(w).toLowerCase()))];
+      const extractedLower = new Set(extractedWords.map(w => String(w).toLowerCase()));
+      const combined = [...extractedWords, ...vectorSearchResults.filter(w => !extractedLower.has(String(w).toLowerCase()))];
       const predictions = combined.slice(0, topN);
       return { predictions, confidenceMap: buildConfidenceMap(predictions) };
     }
@@ -1185,6 +1219,13 @@ Return words only, one per line:
     const predictions = indices.map(i => labels[i]);
     return { predictions, confidenceMap: buildConfidenceMap(predictions) };
   }
+}
+
+async function predictNextTilesLocal(contextLines = '', pressedTiles = [], topN = 10) {
+  if (PREDICTION_MODE === 'llm') {
+    return predictNextTilesLocalLLM(contextLines, pressedTiles, topN);
+  }
+  return predictNextTilesLocalRanked(contextLines, pressedTiles, topN);
 }
 
 app.post('/api/nextTilePredLocal', async (req, res) => {
@@ -1211,7 +1252,7 @@ app.post('/api/nextTilePredLocal', async (req, res) => {
         });
       }
 
-      const { predictions: predicted, confidenceMap } = await predictNextTilesLocalLLM(contextLines, validPressedTiles, topN);
+      const { predictions: predicted, confidenceMap } = await predictNextTilesLocal(contextLines, validPressedTiles, topN);
 
       const transcriptText = (typeof transcript === 'string' && transcript.trim()) ? transcript : contextLines;
       logPredictionEvent({
@@ -1415,30 +1456,33 @@ async function preloadAllModels() {
   const startTime = Date.now();
   
   try {
-    // Load all three models in parallel for faster startup
-    const loadPromises = [
-      (async () => {
-        console.log('[1/3] Loading Whisper transcription model...');
-        const modelStart = Date.now();
-        await getLocalWhisperPipeline();
-        const modelTime = ((Date.now() - modelStart) / 1000).toFixed(2);
-        console.log(`[1/3] ✓ Whisper model loaded (${modelTime}s)`);
-      })(),
-      (async () => {
-        console.log('[2/3] Loading DistilGPT2 LLM model...');
-        const modelStart = Date.now();
-        await getLocalLLMPipeline();
-        const modelTime = ((Date.now() - modelStart) / 1000).toFixed(2);
-        console.log(`[2/3] ✓ LLM model loaded (${modelTime}s)`);
-      })(),
-      (async () => {
-        console.log('[3/3] Loading all-MiniLM-L6-v2 embeddings model...');
-        const modelStart = Date.now();
-        await getLocalEmbeddingPipeline();
-        const modelTime = ((Date.now() - modelStart) / 1000).toFixed(2);
-        console.log(`[3/3] ✓ Embeddings model loaded (${modelTime}s)`);
-      })()
+    const modelLoaders = [
+      {
+        name: 'Whisper transcription model',
+        load: getLocalWhisperPipeline,
+      },
+      {
+        name: 'all-MiniLM-L6-v2 embeddings model',
+        load: getLocalEmbeddingPipeline,
+      },
     ];
+
+    if (PREDICTION_MODE === 'llm') {
+      modelLoaders.push({
+        name: 'DistilGPT2 LLM model',
+        load: getLocalLLMPipeline,
+      });
+    }
+
+    const total = modelLoaders.length;
+    const loadPromises = modelLoaders.map((loader, index) => (async () => {
+      const step = index + 1;
+      console.log(`[${step}/${total}] Loading ${loader.name}...`);
+      const modelStart = Date.now();
+      await loader.load();
+      const modelTime = ((Date.now() - modelStart) / 1000).toFixed(2);
+      console.log(`[${step}/${total}] ✓ ${loader.name} loaded (${modelTime}s)`);
+    })());
     
     // Wait for all models to load
     await Promise.all(loadPromises);
@@ -1471,7 +1515,7 @@ async function startServer() {
       console.log('Server running on http://localhost:' + PORT);
       console.log("Temp directory:", tempDir);
       console.log("[Configuration] Transcription Model: Local Whisper");
-      console.log("[Configuration] Prediction Model: Local LLM with vector search");
+      console.log(`[Configuration] Prediction Model: Local ${PREDICTION_MODE === 'llm' ? 'LLM + vector search' : 'vector ranking'}`);
       console.log("\n✓ Server ready to accept requests!\n");
     });
   } catch (error) {
@@ -1541,14 +1585,6 @@ io.on("connection", (socket) => {
   let isProcessing = false;
   
   /**
-   * Counter for generating unique temporary filenames
-   * 
-   * @type {number}
-   * @description Incremented for each processed audio chunk to ensure unique filenames
-   */
-  let fileCounter = 0;
-  
-  /**
    * Counter for tracking consecutive empty audio inputs
    * 
    * @type {number}
@@ -1589,14 +1625,15 @@ io.on("connection", (socket) => {
   let firstTranscriptionLogged = false;
   
   /**
-   * Duration in milliseconds between audio processing attempts
-   * 
-   * @type {number}
-   * @description Defines how frequently the audio buffer is processed
+   * Audio chunking constants for low-latency/stable processing.
    */
-
-  //CHANGE THIS WAS 3000
-  const CHUNK_DURATION = 1000; // 3 seconds - process more frequently to catch words sooner 
+  const PCM_BYTES_PER_SECOND = 16000 * 2; // 16kHz mono, 16-bit PCM
+  const MIN_AUDIO_SIZE = Math.floor(PCM_BYTES_PER_SECOND * 1.5); // match Whisper minimum window
+  const MAX_AUDIO_SIZE = Math.floor(PCM_BYTES_PER_SECOND * 2.5); // cap to keep Whisper calls bounded
+  const OVERLAP_SIZE = Math.floor(PCM_BYTES_PER_SECOND * 0.25); // preserve 250ms context continuity
+  const FINAL_MIN_AUDIO_SIZE = MIN_AUDIO_SIZE; // keep disconnect path aligned with transcription floor
+  const MAX_BUFFER_SIZE = Math.floor(PCM_BYTES_PER_SECOND * 12); // hard cap to prevent backlog growth
+  const PROCESS_INTERVAL_MS = 250; // short fallback poll in case stdout burst is delayed
 
   /**
    * Initializes the FFmpeg process for audio conversion
@@ -1687,23 +1724,16 @@ io.on("connection", (socket) => {
    */
   ffmpeg.stdout.on("data", (chunk) => {
     audioBuffer = Buffer.concat([audioBuffer, chunk]);
-    
-    // Dynamic chunk sizing: min 3 seconds, max 6 seconds
-    // 3 seconds = 96000 bytes, 6 seconds = 192000 bytes
-    // const minChunkSize = 96000; // 3 seconds = 16000 samples/sec * 2 bytes/sample * 3 sec
-    // const maxChunkSize = 192000; // 6 seconds = 16000 samples/sec * 2 bytes/sample * 6 sec
-    const minChunkSize = 48000;  // 1.5 seconds
-    const maxChunkSize = 96000;  // 3 seconds
-    
-    // Trigger immediate processing if we have enough audio and not already processing
-    // Use dynamic sizing: process when we have at least min, but prefer max for better quality
-    if (!isProcessing && audioBuffer.length >= minChunkSize) {
-      // Process immediately if we have max chunk size, or if we've been waiting
-      if (audioBuffer.length >= maxChunkSize) {
-        processAudio().catch(err => {
-          console.error("Error in immediate audio processing:", err);
-        });
-      }
+
+    if (audioBuffer.length > MAX_BUFFER_SIZE) {
+      audioBuffer = audioBuffer.slice(-MAX_BUFFER_SIZE);
+      console.warn(`[Buffer] Trimmed oversized buffer to ${MAX_BUFFER_SIZE} bytes`);
+    }
+
+    if (!isProcessing && audioBuffer.length >= MIN_AUDIO_SIZE) {
+      processAudio().catch(err => {
+        console.error("Error in immediate audio processing:", err);
+      });
     }
   });
 
@@ -1719,56 +1749,40 @@ io.on("connection", (socket) => {
    * @throws {Error} If there are issues with file operations or the local Whisper model
    * @async
    */
-  const processAudio = async () => {
-    // Dynamic chunk sizing: min 3 seconds, max 6 seconds
-    const minAudioSize = 96000; // 3 seconds = 16000 samples/sec * 2 bytes/sample * 3 sec
-    const maxAudioSize = 192000; // 6 seconds = 16000 samples/sec * 2 bytes/sample * 6 sec
-    
-    // Skip processing if already busy or audio buffer is too small
-    if (isProcessing || audioBuffer.length < minAudioSize) {
+  const processAudio = async ({ allowShortChunk = false } = {}) => {
+    const requiredMinSize = allowShortChunk ? FINAL_MIN_AUDIO_SIZE : MIN_AUDIO_SIZE;
+
+    // Skip processing if already busy or audio buffer is too small.
+    if (isProcessing || audioBuffer.length < requiredMinSize) {
       silenceCounter++;
-      // Only reset buffer if we've had many silent attempts AND buffer is getting very large
-      if (silenceCounter > 20 && audioBuffer.length > 480000) { // > 15 seconds of audio
-        // Reset buffer if too much silence to prevent memory buildup
-        // But keep the last 3 seconds in case there's valid audio
-        const keepSize = 96000; // Keep 3 seconds
+      if (silenceCounter > 80 && audioBuffer.length > MAX_BUFFER_SIZE) {
+        const keepSize = Math.max(MAX_AUDIO_SIZE, MIN_AUDIO_SIZE);
         audioBuffer = audioBuffer.slice(-keepSize);
         silenceCounter = 0;
       }
       return;
     }
+
     // lock processing
     isProcessing = true;
     silenceCounter = 0;
     
-    // Dynamic chunk sizing: use available audio up to max size
-    // Prefer larger chunks (up to 6 seconds) for better context, but use what's available
-    const chunkSize = Math.min(audioBuffer.length, maxAudioSize);
+    const chunkSize = Math.min(audioBuffer.length, MAX_AUDIO_SIZE);
     const initialBufferSize = audioBuffer.length;
     
     // Log buffer size being sent to Whisper
     console.log(`[Buffer] Sending to Whisper: ${chunkSize} bytes (${(chunkSize / 32000).toFixed(2)}s), Initial buffer: ${initialBufferSize} bytes (${(initialBufferSize / 32000).toFixed(2)}s)`);
     
-    // Overlap to catch words at boundaries - 1 second overlap helps ensure no words are missed
-    const overlapSize = 16000; // 0.5 second overlap - ensures words spanning boundaries are captured
+    // Keep slight overlap so words at boundaries aren't dropped.
     const pcmChunk = audioBuffer.slice(0, chunkSize);
-    
-    // DON'T remove audio from buffer yet - wait until we know transcription succeeded
-    // This ensures we don't lose audio if transcription fails
-    
-    // Generate a unique filename per chunk
-    const filename = `temp_${socket.id}_${Date.now()}_${fileCounter++}.wav`;
-    
-    // try creating the wavefile
+
     try {
       const wavData = createWavFile(pcmChunk);
-      const filePath = path.join(tempDir, filename);
-      fs.writeFileSync(filePath, wavData);
       
       // Use local Whisper model for transcription
       let transcribedText = '';
       try {
-        transcribedText = await transcribeAudioLocal(filePath);
+        transcribedText = await transcribeAudioLocal(wavData);
         // Log the raw transcript received from Whisper
         if (transcribedText && transcribedText.trim()) {
           console.log('[Whisper Transcript]', transcribedText);
@@ -1847,7 +1861,7 @@ io.on("connection", (socket) => {
           //pressedTiles is empty for now
         
 
-          const {predictions, confidenceMap} = await predictNextTilesLocalLLM(
+          const {predictions, confidenceMap} = await predictNextTilesLocal(
             transcribedText,
             [],
             10
@@ -1874,7 +1888,7 @@ io.on("connection", (socket) => {
       // Always remove audio from buffer AFTER processing (successful or empty result)
       // This ensures we process all audio sequentially without gaps
       if (shouldRemoveAudio) {
-        const removeSize = chunkSize - overlapSize; // Keep exactly 1 second of overlap
+        const removeSize = Math.max(0, chunkSize - OVERLAP_SIZE);
         audioBuffer = audioBuffer.slice(removeSize);
         // Log remaining buffer size after processing
         console.log(`[Buffer] Remaining buffer: ${audioBuffer.length} bytes (${(audioBuffer.length / 32000).toFixed(2)}s)`);
@@ -1888,7 +1902,7 @@ io.on("connection", (socket) => {
         console.error("Bad request - audio format issue");
         // If there's a format issue, remove a small chunk and try to continue
         // But keep most of the audio in case it's recoverable
-        const smallRemove = 16000; // Remove only 0.5 seconds
+        const smallRemove = Math.floor(PCM_BYTES_PER_SECOND * 0.25);
         if (audioBuffer.length > smallRemove) {
           audioBuffer = audioBuffer.slice(smallRemove);
           console.log(`[Buffer] After error cleanup - Remaining buffer: ${audioBuffer.length} bytes (${(audioBuffer.length / 32000).toFixed(2)}s)`);
@@ -1896,17 +1910,7 @@ io.on("connection", (socket) => {
       }
       // For other errors, keep the audio in buffer to retry on next interval
     } finally {
-      // Clean up temp file
-      try {
-        //delete temp file
-        const filePath = path.join(tempDir, filename);
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-        }
-      } catch (cleanupErr) {
-        console.error("Error cleaning up file:", cleanupErr);
-      }
-      //reset isProcessing
+      // reset isProcessing
       isProcessing = false;
     }
   };
@@ -1917,7 +1921,11 @@ io.on("connection", (socket) => {
    * @type {NodeJS.Timeout}
    * @description Timer that triggers audio processing at regular intervals
    */
-  const interval = setInterval(processAudio, CHUNK_DURATION);
+  const interval = setInterval(() => {
+    processAudio().catch((err) => {
+      console.error("Error in interval audio processing:", err);
+    });
+  }, PROCESS_INTERVAL_MS);
 
   /**
    * Audio chunk event handler
@@ -1980,10 +1988,9 @@ io.on("connection", (socket) => {
     clearInterval(interval);
     
     // Process any remaining audio before cleaning up to capture last words
-    // Use min chunk size (3 seconds) for final processing
-    if (audioBuffer.length >= 96000 && !isProcessing) { // At least 3 seconds
+    if (audioBuffer.length >= FINAL_MIN_AUDIO_SIZE && !isProcessing) {
       try {
-        await processAudio();
+        await processAudio({ allowShortChunk: true });
       } catch (err) {
         console.error("Error processing final audio on disconnect:", err);
       }
