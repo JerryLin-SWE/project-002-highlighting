@@ -593,7 +593,7 @@ function validateTranscription(text, rmsEnergy) {
   }
   
   // If audio energy is very low, be more strict about validation
-  if (rmsEnergy < 0.001) {
+  if (rmsEnergy < 0.0005) {
     // Very low energy - likely silence, reject any transcription
     return false;
   }
@@ -761,8 +761,10 @@ async function transcribeAudioLocal(audioInput) {
     // Calculate RMS energy across entire audio
     const rmsEnergy = calculateRMSEnergy(audioData);
     
-    // Skip if completely silent (threshold set to 0.002)
-    if (rmsEnergy < 0.002) {
+    // Skip if completely silent (threshold set to 0.001)
+    console.log(`[Whisper] RMS energy: ${rmsEnergy.toFixed(4)}`);
+    if (rmsEnergy < 0.001) {
+      console.log(`[Whisper] Skipped - below RMS threshold`);
       return '';
     }
     
@@ -775,8 +777,9 @@ async function transcribeAudioLocal(audioInput) {
         language: 'en', // Specify language to avoid detection step
         // Anti-hallucination parameters
         temperature: [0.0, 0.2],
-        no_speech_threshold: 0.5, 
-        logprob_threshold: -1.5, 
+        //was 0.5
+        no_speech_threshold: 0.35, 
+        logprob_threshold: -2.0, 
         compression_ratio_threshold: 2.4, 
       });
     } catch (error) {
