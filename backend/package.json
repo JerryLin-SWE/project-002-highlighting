@@ -1,6 +1,7 @@
 {
   "type": "module",
   "scripts": {
+    "start": "node server.mjs",
     "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js",
     "coverage": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --coverage"
   },

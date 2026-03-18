@@ -195,6 +195,7 @@ const AudioTranscription = () => {
      * @description Holds the MediaRecorder instance for controlling audio recording
      */
     const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+    const micStreamRef = React.useRef<MediaStream | null>(null);
 
     /**
      * Effect to initialize the MediaRecorder and request microphone permissions
@@ -212,8 +213,9 @@ const AudioTranscription = () => {
             // creates stream. You should get a pop up on your browser on whether or not to allow streaming
             console.log("Asking for mic permission...");
             navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-                // Resume here after user clicks allow 
+                // Resume here after user clicks allow
                 console.log("Got mic stream!", stream);
+                micStreamRef.current = stream;
                 // create recorder
                 mediaRecorderRef.current = new MediaRecorder(stream);
 
@@ -291,7 +293,12 @@ const AudioTranscription = () => {
         if (!payload || !Array.isArray(payload.predictedTiles)) {
             return;
         }
-        setPredictedTiles(payload.predictedTiles);
+        // Blend N-gram suggestions (based on press history) with backend speech predictions
+        // N-gram goes first since it's more context-aware for this user's patterns
+        const ngramResults = ngramService.getSuggestions(utteredTilesRef.current.map(t => t.text), 3);
+        const backendTiles = payload.predictedTiles;
+        const merged = [...ngramResults, ...backendTiles.filter(t => !ngramResults.includes(t))].slice(0, 5);
+        setPredictedTiles(merged.length > 0 ? merged : backendTiles);
         setPredictionTimestamp(Date.now());
     }, [setPredictedTiles]);
 
@@ -309,6 +316,23 @@ const AudioTranscription = () => {
     const startRecording = React.useCallback(() => {
         if (!mediaRecorderRef.current || isRecordingRef.current || !isActive) {
             return; // Already recording, not ready, or not active
+        }
+        // Recreate MediaRecorder if it was stopped (can't restart a stopped one)
+        if (mediaRecorderRef.current.state === 'inactive' && micStreamRef.current) {
+            mediaRecorderRef.current = new MediaRecorder(micStreamRef.current);
+            mediaRecorderRef.current.ondataavailable = (e) => {
+                if (e.data.size > 0) {
+                    e.data.arrayBuffer().then((buffer) => {
+                        socketRef.current?.emit("audio-chunk", buffer);
+                    });
+                }
+                chunksRef.current.push(e.data);
+            };
+            mediaRecorderRef.current.onstop = () => {
+                const blob = new Blob(chunksRef.current, { type: "audio/ogg; codecs=opus" });
+                chunksRef.current = [];
+                setaudioURL(URL.createObjectURL(blob));
+            };
         }
         setRecording(true);
         isRecordingRef.current = true;
@@ -732,7 +756,7 @@ const AudioTranscription = () => {
             if (ngramResults.length > 0) {
             setPredictedTiles(ngramResults);
             }
-            
+
             console.log(`[Prediction] Tile clicked (${utteredTiles.length} tiles) - debouncing prediction`);
             
             // Clear any existing debounce timeout
