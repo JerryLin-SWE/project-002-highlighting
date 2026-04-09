@@ -6,8 +6,9 @@ import { useUtteredTiles } from "@/react-state-management/providers/useUtteredTi
 import { useRecordingControl } from "@/react-state-management/providers/RecordingControlProvider";
 import { useTranscript } from "@/react-state-management/providers/TranscriptProvider";
 import * as ngramService from '@/util/AAC/ngramService';
+import { getBackendUrl } from "@/util/backend-url";
 
-const BACKEND_URL = "http://localhost:5001";
+const BACKEND_URL = getBackendUrl();
 
 type HighlightsPayload = {
     transcript?: string;
