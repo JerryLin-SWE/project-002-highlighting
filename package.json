@@ -1,0 +1,11 @@
+{
+  "name": "project-002-highlighting",
+  "version": "1.0.0",
+  "scripts": {
+    "install": "cd backend && npm install",
+    "start": "cd backend && node server.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
